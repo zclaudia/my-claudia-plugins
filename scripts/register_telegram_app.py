@@ -246,9 +246,9 @@ def create_app(
     raise_for_telegram_text("创建应用", response.status_code, payload)
     if payload.strip().upper() == "ERROR":
         raise TelegramOrgError(
-            "创建应用失败，Telegram 返回了 ERROR。"
-            " 可以换一个 --shortname 后，用同一个 --code 再试一次"
-            "（验证码只能用几分钟，过期需要重新 --phone）。"
+            "创建应用失败，Telegram 只返回了 ERROR。"
+            " 常见原因是当前出口 IP 的国家和手机号国家不一致，"
+            "或 shortname 不是 5 到 32 位小写字母和数字。"
         )
     return payload
 

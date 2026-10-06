@@ -1,0 +1,4 @@
+.telegram-myorg-session.json
+.telegram-app-credentials.json
+__pycache__/
+*.pyc

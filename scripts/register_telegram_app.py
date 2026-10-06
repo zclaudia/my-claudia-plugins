@@ -10,21 +10,22 @@ Two steps:
   python3 scripts/register_telegram_app.py --phone +8613800138000
   python3 scripts/register_telegram_app.py --code 12345
 
-Session cookies and api_hash are written only to gitignored files in the
+Login and the app page must share one HTTP/2 connection. This environment
+changes its public IP on every new TCP connection, and Telegram drops a
+session whose next request comes from a different address.
+
+Requires: pip install 'httpx[http2]'
+
+Session data and api_hash are written only to gitignored files in the
 repository root.
 """
 
 from __future__ import annotations
 
 import argparse
-import http.cookiejar
 import json
 import re
-import ssl
 import sys
-import urllib.error
-import urllib.parse
-import urllib.request
 from pathlib import Path
 
 BASE = "https://my.telegram.org"
@@ -75,83 +76,62 @@ def normalize_phone(phone: str) -> str:
     return compact
 
 
-def cookie_jar_from_state(cookies: list[dict]) -> http.cookiejar.CookieJar:
-    jar = http.cookiejar.CookieJar()
-    for item in cookies:
-        domain = item.get("domain") or "my.telegram.org"
-        jar.set_cookie(
-            http.cookiejar.Cookie(
-                version=0,
-                name=item["name"],
-                value=item["value"],
-                port=None,
-                port_specified=False,
-                domain=domain,
-                domain_specified=True,
-                domain_initial_dot=domain.startswith("."),
-                path=item.get("path") or "/",
-                path_specified=True,
-                secure=bool(item.get("secure", True)),
-                expires=None,
-                discard=True,
-                comment=None,
-                comment_url=None,
-                rest={},
-            )
-        )
-    return jar
-
-
-def cookies_from_jar(jar: http.cookiejar.CookieJar) -> list[dict]:
-    exported = []
-    for cookie in jar:
-        exported.append(
-            {
-                "name": cookie.name,
-                "value": cookie.value,
-                "domain": cookie.domain,
-                "path": cookie.path,
-                "secure": cookie.secure,
-            }
-        )
-    return exported
-
-
-def build_opener(jar: http.cookiejar.CookieJar) -> urllib.request.OpenerDirector:
-    context = ssl.create_default_context()
-    return urllib.request.build_opener(
-        urllib.request.HTTPCookieProcessor(jar),
-        urllib.request.HTTPSHandler(context=context),
-    )
-
-
-def request(
-    opener: urllib.request.OpenerDirector,
-    path: str,
-    data: dict[str, str] | None = None,
-    referer: str = f"{BASE}/auth",
-    accept: str = "application/json, text/javascript, */*; q=0.01",
-) -> tuple[int, str, dict[str, str]]:
-    body = None
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept": accept,
-        "Accept-Language": "en-US,en;q=0.9",
-        "Origin": BASE,
-        "Referer": referer,
-    }
-    if data is not None:
-        body = urllib.parse.urlencode(data).encode()
-        headers["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
-        headers["X-Requested-With"] = "XMLHttpRequest"
-    req = urllib.request.Request(BASE + path, data=body, headers=headers)
+def load_httpx():
     try:
-        with opener.open(req, timeout=30) as response:
-            payload = response.read().decode("utf-8", errors="replace")
-            return response.status, payload, dict(response.headers.items())
-    except urllib.error.HTTPError as exc:
-        payload = exc.read().decode("utf-8", errors="replace")
-        return exc.code, payload, dict(exc.headers.items())
+        import httpx
+    except ImportError as exc:
+        raise TelegramOrgError(
+            "缺少 httpx。请先运行：pip install 'httpx[http2]'"
+        ) from exc
+    return httpx
+
+
+class OrgClient:
+    """One HTTP/2 connection for every authenticated request."""
+
+    def __init__(self):
+        httpx = load_httpx()
+        self._client = httpx.Client(
+            base_url=BASE,
+            http2=True,
+            timeout=30.0,
+            follow_redirects=False,
+            limits=httpx.Limits(max_connections=1, max_keepalive_connections=1),
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+        )
+
+    def close(self) -> None:
+        self._client.close()
+
+    def __enter__(self) -> "OrgClient":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def post_form(self, path: str, data: dict[str, str], referer: str):
+        return self._client.post(
+            path,
+            data=data,
+            headers={
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "Origin": BASE,
+                "Referer": referer,
+                "X-Requested-With": "XMLHttpRequest",
+            },
+        )
+
+    def get_html(self, path: str, referer: str):
+        return self._client.get(
+            path,
+            headers={
+                "Accept": "text/html,application/xhtml+xml",
+                "Referer": referer,
+            },
+        )
 
 
 def save_json(path: Path, payload: dict) -> None:
@@ -167,27 +147,30 @@ def load_session(path: Path) -> dict:
     return json.loads(path.read_text())
 
 
-def send_code(phone: str, session_path: Path) -> None:
-    jar = http.cookiejar.CookieJar()
-    opener = build_opener(jar)
-    status, payload, _headers = request(opener, "/auth/send_password", {"phone": phone})
+def raise_for_telegram_text(action: str, status: int, payload: str) -> None:
+    text = payload.strip()
+    if "too many tries" in text.lower():
+        raise TelegramOrgError(
+            f"{action}被 Telegram 暂时拒绝：{text[:300]}。"
+            " 这个号码需要等一段时间后才能再要验证码。"
+        )
     if status != 200:
-        raise TelegramOrgError(f"发送验证码失败（HTTP {status}）：{payload.strip()[:500]}")
+        raise TelegramOrgError(f"{action}失败（HTTP {status}）：{text[:500]}")
+
+
+def send_code(phone: str, session_path: Path) -> None:
+    with OrgClient() as client:
+        response = client.post_form("/auth/send_password", {"phone": phone}, f"{BASE}/auth")
+    payload = response.text
+    raise_for_telegram_text("发送验证码", response.status_code, payload)
     try:
-        random_hash = json.loads(payload)["random_hash"]
+        random_hash = response.json()["random_hash"]
     except (json.JSONDecodeError, KeyError, TypeError) as exc:
         raise TelegramOrgError(f"发送验证码的响应无法解析：{payload.strip()[:500]}") from exc
-    save_json(
-        session_path,
-        {
-            "phone": phone,
-            "random_hash": random_hash,
-            "cookies": cookies_from_jar(jar),
-        },
-    )
+    save_json(session_path, {"phone": phone, "random_hash": random_hash})
     print("验证码已发到你的 Telegram 客户端（不是短信）。")
     print("请把验证码发过来，或在本机运行：")
-    print(f"  python3 scripts/register_telegram_app.py --code <验证码>")
+    print("  python3 scripts/register_telegram_app.py --code <验证码>")
 
 
 def parse_existing_app(html: str) -> dict[str, str] | None:
@@ -206,24 +189,22 @@ def parse_create_hash(html: str) -> str | None:
     return None
 
 
-def fetch_apps(opener: urllib.request.OpenerDirector) -> str:
-    status, html, _headers = request(
-        opener,
-        "/apps",
-        data=None,
-        referer=f"{BASE}/auth",
-        accept="text/html,application/xhtml+xml",
-    )
-    if status != 200:
-        raise TelegramOrgError(f"打开 /apps 失败（HTTP {status}）：{html.strip()[:500]}")
+def fetch_apps(client: OrgClient, referer: str) -> str:
+    response = client.get_html("/apps", referer)
+    html = response.text
+    if response.status_code != 200:
+        location = response.headers.get("location", "")
+        raise TelegramOrgError(
+            f"打开 /apps 失败（HTTP {response.status_code} {location}）。"
+            " 登录会话没有保留下来。"
+        )
     if 'id="my_login_phone"' in html and "app_title" not in html and "App api_id" not in html:
         raise TelegramOrgError("登录没有成功，页面仍停留在手机号登录。")
     return html
 
 
-def login(opener: urllib.request.OpenerDirector, phone: str, random_hash: str, code: str) -> None:
-    status, payload, _headers = request(
-        opener,
+def login(client: OrgClient, phone: str, random_hash: str, code: str) -> None:
+    response = client.post_form(
         "/auth/login",
         {
             "phone": phone,
@@ -231,16 +212,17 @@ def login(opener: urllib.request.OpenerDirector, phone: str, random_hash: str, c
             "password": code.strip(),
             "remember": "1",
         },
+        f"{BASE}/auth",
     )
-    if status != 200:
-        raise TelegramOrgError(f"登录失败（HTTP {status}）：{payload.strip()[:500]}")
+    payload = response.text
+    raise_for_telegram_text("登录", response.status_code, payload)
     text = payload.strip()
     if text and text not in {"true", "1"}:
         raise TelegramOrgError(f"登录被拒绝：{text[:500]}")
 
 
 def create_app(
-    opener: urllib.request.OpenerDirector,
+    client: OrgClient,
     page_hash: str,
     title: str,
     shortname: str,
@@ -248,8 +230,7 @@ def create_app(
     platform: str,
     description: str,
 ) -> str:
-    status, payload, _headers = request(
-        opener,
+    response = client.post_form(
         "/apps/create",
         {
             "hash": page_hash,
@@ -259,12 +240,13 @@ def create_app(
             "app_platform": platform,
             "app_desc": description,
         },
-        referer=f"{BASE}/apps",
+        f"{BASE}/apps",
     )
-    if status != 200 or payload.strip().upper() == "ERROR":
+    payload = response.text
+    raise_for_telegram_text("创建应用", response.status_code, payload)
+    if payload.strip().upper() == "ERROR":
         raise TelegramOrgError(
-            "创建应用失败。"
-            f" HTTP {status}，响应：{payload.strip()[:500] or '（空）'}。"
+            "创建应用失败，Telegram 返回了 ERROR。"
             " 可以换一个 --shortname 后，用同一个 --code 再试一次"
             "（验证码只能用几分钟，过期需要重新 --phone）。"
         )
@@ -304,42 +286,32 @@ def finish_login(
         raise TelegramOrgError(
             f"验证码会话属于 {phone}，与本次 --phone 不一致。请重新发送验证码。"
         )
-    jar = cookie_jar_from_state(state.get("cookies") or [])
-    opener = build_opener(jar)
-    login(opener, phone, state["random_hash"], code)
-    save_json(
-        session_path,
-        {
-            "phone": phone,
-            "random_hash": state["random_hash"],
-            "cookies": cookies_from_jar(jar),
-        },
-    )
-
-    html = fetch_apps(opener)
-    existing = parse_existing_app(html)
-    created = False
-    if existing is None:
-        page_hash = parse_create_hash(html)
-        if not page_hash:
-            debug_path = Path("/tmp/telegram-apps-page.html")
-            debug_path.write_text(html)
-            debug_path.chmod(0o600)
-            raise TelegramOrgError(
-                "登录后的页面里既没有已有应用，也没有创建表单。"
-                f" 页面已保存到 {debug_path}。"
-            )
-        create_app(opener, page_hash, title, shortname, url, platform, description)
-        created = True
-        html = fetch_apps(opener)
+    with OrgClient() as client:
+        login(client, phone, state["random_hash"], code)
+        html = fetch_apps(client, f"{BASE}/auth")
         existing = parse_existing_app(html)
+        created = False
         if existing is None:
-            debug_path = Path("/tmp/telegram-apps-page.html")
-            debug_path.write_text(html)
-            debug_path.chmod(0o600)
-            raise TelegramOrgError(
-                f"应用创建请求已提交，但没有读到 api_id。页面已保存到 {debug_path}。"
-            )
+            page_hash = parse_create_hash(html)
+            if not page_hash:
+                debug_path = Path("/tmp/telegram-apps-page.html")
+                debug_path.write_text(html)
+                debug_path.chmod(0o600)
+                raise TelegramOrgError(
+                    "登录后的页面里既没有已有应用，也没有创建表单。"
+                    f" 页面已保存到 {debug_path}。"
+                )
+            create_app(client, page_hash, title, shortname, url, platform, description)
+            created = True
+            html = fetch_apps(client, f"{BASE}/apps")
+            existing = parse_existing_app(html)
+            if existing is None:
+                debug_path = Path("/tmp/telegram-apps-page.html")
+                debug_path.write_text(html)
+                debug_path.chmod(0o600)
+                raise TelegramOrgError(
+                    f"应用创建请求已提交，但没有读到 api_id。页面已保存到 {debug_path}。"
+                )
 
     store_credentials(credentials_path, phone, existing, created)
     action = "已创建新应用" if created else "这个号码已经有应用，Telegram 每个号码只能有一个"
@@ -350,17 +322,12 @@ def finish_login(
 
 
 def doctor() -> None:
-    jar = http.cookiejar.CookieJar()
-    opener = build_opener(jar)
-    status, html, _headers = request(
-        opener,
-        "/auth",
-        data=None,
-        accept="text/html,application/xhtml+xml",
-    )
-    if status != 200 or "/auth/send_password" not in html:
+    with OrgClient() as client:
+        response = client.get_html("/auth", f"{BASE}/")
+    if response.status_code != 200 or "/auth/send_password" not in response.text:
         raise TelegramOrgError(
-            f"打不开 my.telegram.org 登录页（HTTP {status}）。当前网络可能被 Telegram 拦截。"
+            f"打不开 my.telegram.org 登录页（HTTP {response.status_code}）。"
+            "当前网络可能被 Telegram 拦截。"
         )
     print("my.telegram.org 登录页可以访问，发送验证码的接口还在页面里。")
 
